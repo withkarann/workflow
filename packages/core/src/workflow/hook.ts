@@ -166,6 +166,36 @@ export function createCreateHook(ctx: WorkflowOrchestratorContext) {
     // stays useful after that lands, for logs written before it deployed.
     const seenResumeIds = new Set<string>();
 
+    /**
+     * Signal that this hook has nothing left to deliver, once every in-flight
+     * delivery has settled — unless the run has already moved past the
+     * boundary the signal was armed for.
+     *
+     * The generation guard mirrors the step consumer's (see `step.ts`): it is
+     * read when the signal is armed and re-checked when it fires, so a signal
+     * belonging to a boundary a retained session has since resumed past is
+     * dropped instead of raising a suspension the workflow never reached — one
+     * carrying none of the work that resume kicked off, which the runtime would
+     * dutifully schedule as nothing and leave the run dormant.
+     *
+     * Dropping is safe because it is never the last word. Every resume appends
+     * through the events consumer, whose drain re-offers the end-of-log
+     * sentinel, and whichever consumer is still waiting arms a fresh signal
+     * under the new generation. The same reasoning covers a same-boundary
+     * duplicate: the first signal to land IS the suspension, and it bumps the
+     * generation, so the siblings it staled were only ever going to report the
+     * boundary already reported.
+     */
+    function suspendWhenIdle(): void {
+      const generation = ctx.suspensionGeneration;
+      scheduleWhenIdle(ctx, () => {
+        if (generation !== ctx.suspensionGeneration) return;
+        ctx.onWorkflowError(
+          new WorkflowSuspension(ctx.invocationsQueue, ctx.globalThis)
+        );
+      });
+    }
+
     webhookLogger.debug('Hook consumer setup', { correlationId, token });
     ctx.eventsConsumer.subscribe((event) => {
       // If there are no events and there are promises waiting,
@@ -178,11 +208,7 @@ export function createCreateHook(ctx: WorkflowOrchestratorContext) {
           (promises.length > 0 && payloadsQueue.length === 0) ||
           (getConflictPromises.length > 0 && !hasCreated && !hasConflict)
         ) {
-          scheduleWhenIdle(ctx, () => {
-            ctx.onWorkflowError(
-              new WorkflowSuspension(ctx.invocationsQueue, ctx.globalThis)
-            );
-          });
+          suspendWhenIdle();
         }
         return EventConsumerResult.NotConsumed;
       }
@@ -503,11 +529,7 @@ export function createCreateHook(ctx: WorkflowOrchestratorContext) {
       }
 
       if (eventLogEmpty) {
-        scheduleWhenIdle(ctx, () => {
-          ctx.onWorkflowError(
-            new WorkflowSuspension(ctx.invocationsQueue, ctx.globalThis)
-          );
-        });
+        suspendWhenIdle();
       }
 
       promises.push(resolvers);
@@ -547,11 +569,7 @@ export function createCreateHook(ctx: WorkflowOrchestratorContext) {
       }
 
       if (eventLogEmpty) {
-        scheduleWhenIdle(ctx, () => {
-          ctx.onWorkflowError(
-            new WorkflowSuspension(ctx.invocationsQueue, ctx.globalThis)
-          );
-        });
+        suspendWhenIdle();
       }
 
       getConflictPromises.push(resolvers);
@@ -582,11 +600,7 @@ export function createCreateHook(ctx: WorkflowOrchestratorContext) {
       // never deliver another hook_received after disposal.
       if (promises.length > 0) {
         promises.length = 0;
-        scheduleWhenIdle(ctx, () => {
-          ctx.onWorkflowError(
-            new WorkflowSuspension(ctx.invocationsQueue, ctx.globalThis)
-          );
-        });
+        suspendWhenIdle();
       }
 
       webhookLogger.debug('Hook disposed', { correlationId, token });

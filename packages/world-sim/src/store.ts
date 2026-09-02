@@ -1334,7 +1334,13 @@ export function createSimStore(options: SimStoreOptions): SimStore {
         hasMore: page.hasMore,
       };
     } else if (
-      isTerminalStepEventType(data.eventType) &&
+      // The writes the Vercel World computes a `sinceCursor` delta for: a
+      // step-terminal event (the inline sequential loop) and `hook_created`
+      // (the awaited `hook.getConflict()` continuation). Mirrored here rather
+      // than answered for every type, so a scenario sees the same
+      // delta-or-fall-back split the backend actually produces.
+      (isTerminalStepEventType(data.eventType) ||
+        data.eventType === 'hook_created') &&
       typeof params?.sinceCursor === 'string'
     ) {
       const page = paginate(applyWithhold(eventsForRun(runId)), {

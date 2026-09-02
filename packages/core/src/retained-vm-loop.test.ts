@@ -193,13 +193,34 @@ registerStepFunction('r_s1', async () => 10);
 registerStepFunction('r_s2', async () => 20);
 registerStepFunction('r_echo', async (value) => value);
 
+// A `hook.getConflict()` awaiter, whose whole continuation is the
+// `hook_created` the suspension commits. The step after it proves the
+// resumed VM keeps running past the awaiter rather than just settling it.
+const hookConflictWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
+  const createHook = globalThis[Symbol.for("WORKFLOW_CREATE_HOOK")];
+  async function workflow() {
+    const hook = createHook({ token: "retained-conflict-token" });
+    const conflict = await hook.getConflict();
+    const a = await s1();
+    return conflict === null ? a : -1;
+  }
+  globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
+
 // Drive the full workflow handler over a stateful (dynamic) event log so the
 // inline loop makes real progress across its own writes, exactly like a World.
 // Non-turbo (no runInput, attempt 2) to keep the path simple and deterministic.
 async function drive(
   runId: string,
   workflowCode = twoStepWorkflow,
-  options: { failEventTypeOnce?: string } = {}
+  options: {
+    failEventTypeOnce?: string;
+    /**
+     * Answer `sinceCursor` with no delta, the way a World that does not
+     * implement it does. The runtime must then read from its cursor instead of
+     * assuming the log was carried forward.
+     */
+    withholdDelta?: boolean;
+  } = {}
 ) {
   let { failEventTypeOnce } = options;
   const run: WorkflowRun = {
@@ -214,46 +235,79 @@ async function drive(
   };
   const events: Event[] = [];
   const createdEvents: any[] = [];
+  const createParams: any[] = [];
   let seq = 0;
 
-  const eventsCreate = vi.fn(async (_runId: string, data: any) => {
-    if (data.eventType === failEventTypeOnce) {
-      failEventTypeOnce = undefined;
-      throw new PreconditionFailedError('stale snapshot (test-injected)');
+  // Cursors, positioned like a World's: each one is issued for a log of a
+  // known length, so the delta since it is everything appended after.
+  let cursorSeq = 0;
+  const cursorPosition = new Map<string, number>();
+  const nextCursor = (): string => {
+    const cursor = `cursor_${++cursorSeq}`;
+    cursorPosition.set(cursor, events.length);
+    return cursor;
+  };
+
+  const eventsCreate = vi.fn(
+    async (_runId: string, data: any, params?: any) => {
+      if (data.eventType === failEventTypeOnce) {
+        failEventTypeOnce = undefined;
+        throw new PreconditionFailedError('stale snapshot (test-injected)');
+      }
+      createdEvents.push(data);
+      createParams.push({ eventType: data.eventType, ...params });
+      if (data.eventType === 'run_started') {
+        return { run, events };
+      }
+      const event = {
+        eventId: slotToEventId(++seq),
+        runId,
+        createdAt: new Date(),
+        ...data,
+      } as Event;
+      events.push(event);
+      // Inline delta: everything appended since the caller's cursor, this write
+      // included — the same page an `events.list` from that cursor would return
+      // right now. Any event type may be asked (see world-local).
+      const delta =
+        typeof params?.sinceCursor === 'string' && !options.withholdDelta
+          ? {
+              events: events.slice(cursorPosition.get(params.sinceCursor) ?? 0),
+              cursor: nextCursor(),
+              hasMore: false,
+            }
+          : undefined;
+      // step_started returns a running step entity so executeStep proceeds to
+      // run the body and write step_completed.
+      if (data.eventType === 'step_started') {
+        const d = data.eventData as { stepName?: string; input?: unknown };
+        return {
+          event,
+          step: {
+            runId,
+            stepId: data.correlationId,
+            stepName: d.stepName,
+            status: 'running' as const,
+            attempt: 1,
+            input: d.input,
+            startedAt: new Date(),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          ...(d.input !== undefined ? { stepCreated: true } : {}),
+          ...delta,
+        };
+      }
+      return { event, ...delta };
     }
-    createdEvents.push(data);
-    if (data.eventType === 'run_started') {
-      return { run, events };
-    }
-    const event = {
-      eventId: slotToEventId(++seq),
-      runId,
-      createdAt: new Date(),
-      ...data,
-    } as Event;
-    events.push(event);
-    // step_started returns a running step entity so executeStep proceeds to
-    // run the body and write step_completed.
-    if (data.eventType === 'step_started') {
-      const d = data.eventData as { stepName?: string; input?: unknown };
-      return {
-        event,
-        step: {
-          runId,
-          stepId: data.correlationId,
-          stepName: d.stepName,
-          status: 'running' as const,
-          attempt: 1,
-          input: d.input,
-          startedAt: new Date(),
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        },
-        ...(d.input !== undefined ? { stepCreated: true } : {}),
-      };
-    }
-    return { event };
-  });
+  );
+
+  const eventsList = vi.fn(async () => ({
+    data: [...events],
+    hasMore: false,
+    cursor: nextCursor(),
+  }));
+  const queueSend = vi.fn(async () => ({ messageId: null }));
 
   setWorld({
     specVersion: SPEC_VERSION_CURRENT,
@@ -274,14 +328,10 @@ async function drive(
     ),
     events: {
       create: eventsCreate,
-      list: vi.fn(async () => ({
-        data: [...events],
-        hasMore: false,
-        cursor: 'cursor_retained',
-      })),
+      list: eventsList,
     },
     runs: { get: vi.fn(async () => run) },
-    queue: vi.fn(async () => ({ messageId: null })),
+    queue: queueSend,
     getEncryptionKeyForRun: vi.fn(async () => undefined),
   } as any);
 
@@ -291,6 +341,10 @@ async function drive(
     ?.eventData?.output as Uint8Array | undefined;
   return {
     vmBuilds: createContextSpy.mock.calls.length,
+    listCalls: eventsList.mock.calls.length,
+    queueSends: queueSend.mock.calls.length,
+    createParams,
+    createdHook: createdEvents.some((e) => e.eventType === 'hook_created'),
     output,
     result:
       output === undefined
@@ -432,5 +486,71 @@ describe('retained VM through the inline replay loop', () => {
     );
     expect(result).toBe(30);
     expect(vmBuilds).toBe(1);
+  });
+
+  /**
+   * A `hook.getConflict()` awaiter is resolved by the `hook_created` its own
+   * suspension commits, so the parked VM is one `await` away from continuing.
+   * These pin that it continues HERE — in the delivery that made the write —
+   * rather than through a queue message whose only job would be to read that
+   * event back and replay to the same point.
+   *
+   * The harness invokes the handler exactly once, so "the run completed" is
+   * also "no re-invocation was needed": the pre-change path returns a
+   * visibility timeout to the queue and leaves the run unfinished.
+   */
+  describe('hook.getConflict() continuation', () => {
+    it('resolves the awaiter in-process, off the hook write response', async () => {
+      const { result, listCalls, queueSends, createParams } = await drive(
+        'wrun_retained_hook_conflict',
+        hookConflictWorkflow
+      );
+
+      // The awaiter saw a clean registration and the step after it ran, all
+      // within this one delivery.
+      expect(result).toBe(10);
+      // The hook create asked for the delta that made that possible.
+      expect(
+        createParams.find((p) => p.eventType === 'hook_created')?.sinceCursor
+      ).toEqual(expect.any(String));
+      // One list: the invocation's initial load. The hook write carried the
+      // log forward from there, so the continuation read nothing.
+      expect(listCalls).toBe(1);
+      // Nothing was enqueued: no re-invocation, and the run's only step ran
+      // inline after the awaiter had already settled.
+      expect(queueSends).toBe(0);
+    });
+
+    it('reads from its cursor and still continues when the World returns no delta', async () => {
+      // `sinceCursor` is optional by contract. Without a delta the log is
+      // short of the hook_created, so the continuation must load from the
+      // cursor before resuming — and must not resume over the stale log.
+      const { result, listCalls, queueSends } = await drive(
+        'wrun_retained_hook_conflict_no_delta',
+        hookConflictWorkflow,
+        { withholdDelta: true }
+      );
+
+      expect(result).toBe(10);
+      // The initial load plus the continuation's incremental read — still one
+      // list against the delivery round-trip and full replay it replaces.
+      expect(listCalls).toBeGreaterThan(1);
+      expect(queueSends).toBe(0);
+    });
+
+    it('hands the awaiter back to the queue under the kill switch', async () => {
+      // With retention off there is no parked VM to resume, so the awaiter
+      // falls back to the re-invocation this path has always used: the
+      // handler returns a visibility timeout and the run finishes on the
+      // next delivery, which this single-invocation harness never makes.
+      process.env.WORKFLOW_RETAINED_VM = '0';
+      const { result, createdHook } = await drive(
+        'wrun_retained_hook_conflict_off',
+        hookConflictWorkflow
+      );
+
+      expect(createdHook).toBe(true);
+      expect(result).toBeUndefined();
+    });
   });
 });

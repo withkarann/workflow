@@ -69,7 +69,7 @@ import {
 } from './runtime/deployment-guard.js';
 import {
   absorbSkippedSlotReport,
-  appendUniqueEvents,
+  appendEventLog,
   getQueueOverhead,
   getWorkflowQueueName,
   handleHealthCheckMessage,
@@ -535,11 +535,6 @@ function nextEventLogLoad(log: LoadedEventLog): ReplayEventLog {
   };
 }
 
-function appendEventLog(log: LoadedEventLog, appended: LoadedEventLog): void {
-  appendUniqueEvents(log.events, appended.events);
-  log.cursor = appended.cursor ?? log.cursor;
-}
-
 /**
  * The whole retention predicate: keep the session only for a pure step
  * boundary (every suspension item is a step — any other item type, present
@@ -548,15 +543,20 @@ function appendEventLog(log: LoadedEventLog, appended: LoadedEventLog): void {
  * attributes require replay; hooks and waits can wake another invocation.
  * `WORKFLOW_RETAINED_VM=0` disables retention entirely.
  *
+ * The one boundary that is not a pure step boundary and is still retainable is
+ * the awaited hook creation — see `awaitedHookCreation` below.
+ *
  * The open hook/wait scan is O(events), so it is taken through a lazy getter
  * and consulted last, after every cheap check has passed.
  *
  * INVARIANT this predicate leans on: every suspension signaler that does NOT
- * carry the step-consumer generation guard (sleep, hook, attribute — see
+ * carry the step-consumer generation guard (sleep, attribute — see
  * `suspensionGeneration` in private.ts) must be unretainable here, either via
  * a non-step queue item or the open hook/wait scan. A new signaler that
  * satisfies neither would let a stale signal be accepted as a fresh
- * suspension on a resumed session.
+ * suspension on a resumed session. The hook consumer carries the guard (see
+ * `suspendWhenIdle` in workflow/hook.ts), which is what lets the awaited-hook
+ * boundary below be retainable at all.
  *
  * Quiescence assumes workflow code stays inside the sandbox's determinism
  * contract. Escaping to the host realm (e.g. recovering the host `Function`
@@ -567,11 +567,41 @@ function appendEventLog(log: LoadedEventLog, appended: LoadedEventLog): void {
 function canRetainWorkflowSession(
   suspension: WorkflowSuspension,
   stepInputsSafe: boolean,
-  openHookWait: { value: ReturnType<typeof openHookAndWaitState> }
+  openHookWait: { value: ReturnType<typeof openHookAndWaitState> },
+  /**
+   * Whether this suspension committed the `hook_created` a
+   * `hook.getConflict()` awaiter is waiting on. The caller resolves that
+   * awaiter by resuming the session in this process over that event rather
+   * than re-invoking (see the `hasAwaitedHookCreation` branch below), so the
+   * boundary is retained on its own terms.
+   */
+  awaitedHookCreation: boolean
 ): boolean {
+  if (!isVmRetentionEnabled() || !stepInputsSafe) {
+    return false;
+  }
+  if (awaitedHookCreation) {
+    // Hooks are allowed here — the awaiter is one — and steps ride along:
+    // this suspension executes none of them inline (`lazyInlineSteps` is
+    // empty whenever an awaiter is present), so they are queued and nothing
+    // this invocation does can order the awaiter's continuation behind a step
+    // body. An open hook is inherent to the boundary rather than a hazard at
+    // it: the hook this suspension just created is one, and a `hook_received`
+    // landing out of band is absent from the log the resume reads the same way
+    // it is absent from a fetch that returned a moment before it — a prefix,
+    // never a hole, corrected on the next write.
+    //
+    // Waits are excluded on both counts. A `wait_completed` is a resolution
+    // the replay is waiting on rather than an event it can observe an
+    // iteration late, and the sleep consumer's suspension signal carries no
+    // generation guard, so a stale one could fire on the resumed session.
+    return (
+      suspension.steps.every(
+        (item) => item.type === 'step' || item.type === 'hook'
+      ) && !openHookWait.value.openWait
+    );
+  }
   if (
-    !isVmRetentionEnabled() ||
-    !stepInputsSafe ||
     suspension.steps.length === 0 ||
     !suspension.steps.every((item) => item.type === 'step')
   ) {
@@ -2572,6 +2602,20 @@ export function workflowEntrypoint(
                   // replays. Invocation-scoped: dies with this delivery.
                   let retainedSession: WorkflowSession | null = null;
 
+                  // Hooks whose `hook.getConflict()` awaiter this invocation
+                  // has already resolved by continuing in this process.
+                  //
+                  // Tracked by hook, not by count, because a repeat for the
+                  // SAME hook is the only shape that cannot make progress: the
+                  // awaiter is resolved by a `hook_created` the suspension
+                  // already committed, so a pass that comes back asking for
+                  // the same one ran over a log that still did not hold that
+                  // event, and continuing again would spin. A hook that has
+                  // not been seen here before is a pass that got somewhere, so
+                  // a workflow creating one awaited hook after another keeps
+                  // continuing in-process for each.
+                  const continuedAwaitedHooks = new Set<string>();
+
                   // Main replay loop
                   // biome-ignore lint/correctness/noConstantCondition: intentional loop
                   while (true) {
@@ -3238,17 +3282,21 @@ export function workflowEntrypoint(
                           replayPayloadCache.resetScan();
                         }
 
-                        // Open hooks/waits in the log as loaded for this
-                        // replay. This suspension's own hook/wait writes are
-                        // NOT in it — they never reach retention anyway,
-                        // because a suspension containing a non-step item
-                        // fails canRetainWorkflowSession's type check before
-                        // the scan is consulted. Computed
-                        // lazily, at most once, and shared between the
-                        // retention decision here and the delta/turbo gates
-                        // below — the attr-detour and hook-conflict paths
-                        // return/continue before the gates and usually
-                        // short-circuit before ever scanning the log.
+                        // Open hooks/waits in the log this replay ran over,
+                        // plus whatever the suspension's own writes folded back
+                        // into it — so a `hook_created` this suspension
+                        // committed and got a delta for IS in the scan, while
+                        // one it wrote without a delta is not. Neither reading
+                        // changes an outcome below: every gate that consults
+                        // `openHook` also treats "this suspension created a
+                        // hook" as equivalent, and the retention predicate
+                        // reaches the scan only on boundaries whose item types
+                        // it has already accepted. Computed lazily, at most
+                        // once, and shared between the retention decision here
+                        // and the delta/turbo gates below — the attr-detour and
+                        // hook-conflict paths return/continue before the gates
+                        // and usually short-circuit before ever scanning the
+                        // log.
                         const openHookWait = once(() => {
                           assert(eventLog.type === 'ready');
                           return openHookAndWaitState(eventLog.events);
@@ -3257,13 +3305,15 @@ export function workflowEntrypoint(
                         // The single retention decision: keep the parked
                         // session only across a pure step boundary with no
                         // out-of-band continuation source and provably
-                        // passive step inputs.
+                        // passive step inputs — or across the awaited hook
+                        // creation this invocation resolves in-process.
                         if (
                           retainedSession &&
                           !canRetainWorkflowSession(
                             err,
                             suspensionResult.retainedStepInputsSafe,
-                            openHookWait
+                            openHookWait,
+                            suspensionResult.hasAwaitedHookCreation
                           )
                         ) {
                           retainedSession = null;
@@ -3332,14 +3382,15 @@ export function workflowEntrypoint(
                         // is present. That awaiter case must execute nothing
                         // inline: an inline `await executeStep(...)` blocks this
                         // handler for the full step duration, so the awaiter's
-                        // continuation (which only advances on the next replay)
+                        // continuation (which only advances on the next pass)
                         // would be serialized behind the step — defeating work
                         // the workflow expressed as parallel (e.g.
                         // `hook.getConflict().then(() => stepB())` racing `await
                         // stepA()`). In that case `lazyInlineSteps` is empty and
-                        // every step is queued for re-invocation, which replays
-                        // over the just-committed hook_created and resolves the
-                        // awaiter while queued steps run in parallel invocations.
+                        // every step is queued, so the continuation below —
+                        // which resumes the parked VM over the just-committed
+                        // hook_created — races those queued steps rather than
+                        // waiting on any of them.
                         const lazyInlineSteps =
                           suspensionResult.lazyInlineSteps;
                         const inlineCorrelationIds = new Set(
@@ -3652,13 +3703,66 @@ export function workflowEntrypoint(
                         // queued (or no work needs scheduling). Exit and let
                         // the queue drive subsequent replays.
                         if (inlineExecutions.length === 0) {
-                          // A `hook.getConflict()` awaiter needs an immediate
-                          // re-invocation: the replay consumes the
-                          // just-committed hook_created and resolves the
-                          // awaiter. Without it (no inline step, all work
-                          // queued or none pending) the run would sit idle
+                          // A `hook.getConflict()` awaiter needs the workflow
+                          // to continue: the `hook_created` this suspension
+                          // just committed is what resolves it, and nothing
+                          // else will — no step ran here, and every step this
+                          // suspension scheduled went to the queue — so
+                          // without a continuation the run would sit idle
                           // until some unrelated message woke it.
                           if (suspensionResult.hasAwaitedHookCreation) {
+                            const freshAwaitedHooks =
+                              suspensionResult.awaitedHookCorrelationIds.filter(
+                                (id) => !continuedAwaitedHooks.has(id)
+                              );
+                            if (
+                              retainedSession &&
+                              freshAwaitedHooks.length > 0
+                            ) {
+                              // Continue in THIS process. The parked VM is one
+                              // `await` away from consuming the hook_created,
+                              // so resuming it over the carried-forward log
+                              // costs neither the queue hop nor the cold replay
+                              // the re-invocation below pays for. Steps stay
+                              // queued: this invocation runs none of them, so
+                              // the awaiter's continuation is still not
+                              // serialized behind a step body — the property
+                              // that an awaiter emptying `lazyInlineSteps`
+                              // exists to protect.
+                              //
+                              // The suspension's writes carried the log forward
+                              // only if the hook create's delta accounted for
+                              // all of them; otherwise read from the cursor
+                              // first, which is still one list against the
+                              // delivery round-trip and full replay it
+                              // replaces.
+                              for (const id of freshAwaitedHooks) {
+                                continuedAwaitedHooks.add(id);
+                              }
+                              if (!suspensionResult.eventLogCarriedForward) {
+                                eventLog = nextEventLogLoad(eventLog);
+                              }
+                              runtimeLogger.debug(
+                                'Resolving a hook.getConflict() awaiter in-process',
+                                {
+                                  workflowRunId: runId,
+                                  loopIteration,
+                                  hookIds: freshAwaitedHooks,
+                                  carriedForward:
+                                    suspensionResult.eventLogCarriedForward,
+                                }
+                              );
+                              span?.setAttributes({
+                                'workflow.awaited_hook_continuations':
+                                  continuedAwaitedHooks.size,
+                              });
+                              continue;
+                            }
+                            // No session to resume (retention off, or a
+                            // boundary the predicate refused), or this hook's
+                            // awaiter already had its continuation and still
+                            // wants one. Hand the run back for a fresh replay
+                            // over the committed hook_created.
                             return await reinvoke(0);
                           }
                           return;

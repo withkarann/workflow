@@ -626,6 +626,224 @@ describe('handleSuspension', () => {
       expect(maxEventSlot(eventLog.events)).toBe(1);
     });
   });
+
+  // The `hook_created` write asks the World for the event-log delta since the
+  // caller's cursor, so a caller holding a `hook.getConflict()` awaiter can
+  // resolve it off the response instead of re-invoking to read the event back.
+  describe('hook creation inline delta', () => {
+    function slotEvent(slot: number, eventType: Event['eventType']): Event {
+      return {
+        eventId: slotToEventId(slot),
+        eventType,
+        runId: run.runId,
+        createdAt: new Date(),
+      } as Event;
+    }
+
+    function awaitedHook(correlationId = 'hook_awaited') {
+      return [
+        correlationId,
+        {
+          type: 'hook' as const,
+          correlationId,
+          token: `tok-${correlationId}`,
+          hasConflictAwaiter: true,
+        },
+      ] as const;
+    }
+
+    /** A World that answers `sinceCursor` with the write it just committed. */
+    function deltaWorld(startSlot = 2) {
+      let slot = startSlot;
+      return vi.fn(async (_runId, event, params) => {
+        const committed = { ...event, eventId: slotToEventId(slot++) } as Event;
+        if (typeof params?.sinceCursor !== 'string') {
+          return { event: committed };
+        }
+        return {
+          event: committed,
+          events: [committed],
+          cursor: `eid:${committed.eventId}`,
+          hasMore: false,
+        };
+      });
+    }
+
+    it('folds the created hook event into the caller log and says so', async () => {
+      const eventLog = {
+        events: [slotEvent(1, 'run_started')],
+        cursor: 'eid:cursor_1',
+      };
+      const eventsCreate = deltaWorld();
+
+      const result = await handleSuspension({
+        suspension: new WorkflowSuspension(
+          new Map([awaitedHook()]),
+          globalThis
+        ),
+        world: createWorld(eventsCreate),
+        run,
+        eventLog,
+      });
+
+      expect(eventsCreate).toHaveBeenCalledWith(
+        run.runId,
+        expect.objectContaining({ eventType: 'hook_created' }),
+        expect.objectContaining({ sinceCursor: 'eid:cursor_1' })
+      );
+      // The log now holds the event that resolves the awaiter, and its read
+      // position moved with it — so a caller can replay/resume off it with no
+      // read of its own.
+      expect(eventLog.events.map((e) => e.eventType)).toEqual([
+        'run_started',
+        'hook_created',
+      ]);
+      expect(eventLog.cursor).toBe(`eid:${slotToEventId(2)}`);
+      expect(result.eventLogCarriedForward).toBe(true);
+      expect(result.awaitedHookCorrelationIds).toEqual(['hook_awaited']);
+      // A delta is not a skipped-slot report: it extends the tail, so the
+      // caller's cached scan positions stay valid.
+      expect(result.reportedEventCount).toBe(0);
+    });
+
+    it('does not carry the log forward when a step also wrote', async () => {
+      // The step_created lands above the delta the hook write returned, so the
+      // log is short of it and the caller has to read before continuing.
+      const eventLog = {
+        events: [slotEvent(1, 'run_started')],
+        cursor: 'eid:cursor_1',
+      };
+
+      const result = await handleSuspension({
+        suspension: new WorkflowSuspension(
+          new Map([
+            awaitedHook(),
+            [
+              's1',
+              {
+                type: 'step' as const,
+                correlationId: 's1',
+                stepName: 's1',
+                args: [],
+              },
+            ],
+          ]),
+          globalThis
+        ),
+        world: createWorld(deltaWorld()),
+        run,
+        eventLog,
+      });
+
+      // An awaiter still means nothing runs inline, so the step keeps its
+      // eager step_created and is queued by the caller.
+      expect(result.lazyInlineSteps).toEqual([]);
+      expect(result.createdStepCorrelationIds).toContain('s1');
+      expect(result.hasAwaitedHookCreation).toBe(true);
+      expect(result.eventLogCarriedForward).toBe(false);
+    });
+
+    it('asks for no delta when the suspension creates two hooks', async () => {
+      // Both creates would diff against the same cursor and only one delta
+      // could be folded in, so the log would end up short of the other's event
+      // with nothing to say so.
+      const eventLog = {
+        events: [slotEvent(1, 'run_started')],
+        cursor: 'eid:cursor_1',
+      };
+      const eventsCreate = deltaWorld();
+
+      const result = await handleSuspension({
+        suspension: new WorkflowSuspension(
+          new Map([awaitedHook('hook_a'), awaitedHook('hook_b')]),
+          globalThis
+        ),
+        world: createWorld(eventsCreate),
+        run,
+        eventLog,
+      });
+
+      for (const call of eventsCreate.mock.calls) {
+        expect(call[2]?.sinceCursor).toBeUndefined();
+      }
+      expect(result.eventLogCarriedForward).toBe(false);
+      expect([...result.awaitedHookCorrelationIds].sort()).toEqual([
+        'hook_a',
+        'hook_b',
+      ]);
+    });
+
+    it('declines a truncated delta rather than moving the cursor past it', async () => {
+      const eventLog = {
+        events: [slotEvent(1, 'run_started')],
+        cursor: 'eid:cursor_1',
+      };
+      const eventsCreate = vi.fn(async (_runId, event) => ({
+        event: { ...event, eventId: slotToEventId(2) },
+        events: [slotEvent(2, 'hook_created')],
+        cursor: 'eid:cursor_2',
+        hasMore: true,
+      }));
+
+      const result = await handleSuspension({
+        suspension: new WorkflowSuspension(
+          new Map([awaitedHook()]),
+          globalThis
+        ),
+        world: createWorld(eventsCreate),
+        run,
+        eventLog,
+      });
+
+      expect(eventLog.events.map((e) => e.eventType)).toEqual(['run_started']);
+      expect(eventLog.cursor).toBe('eid:cursor_1');
+      expect(result.eventLogCarriedForward).toBe(false);
+    });
+
+    it('leaves the log alone when the World returns no delta', async () => {
+      // Any World may ignore `sinceCursor`; the caller then reads instead.
+      const eventLog = {
+        events: [slotEvent(1, 'run_started')],
+        cursor: 'eid:cursor_1',
+      };
+      const eventsCreate = vi.fn(async (_runId, event) => ({
+        event: { ...event, eventId: slotToEventId(2) },
+      }));
+
+      const result = await handleSuspension({
+        suspension: new WorkflowSuspension(
+          new Map([awaitedHook()]),
+          globalThis
+        ),
+        world: createWorld(eventsCreate),
+        run,
+        eventLog,
+      });
+
+      expect(eventLog.events.map((e) => e.eventType)).toEqual(['run_started']);
+      expect(eventLog.cursor).toBe('eid:cursor_1');
+      expect(result.eventLogCarriedForward).toBe(false);
+      expect(result.hasAwaitedHookCreation).toBe(true);
+    });
+
+    it('asks for no delta on a log with no cursor (turbo)', async () => {
+      const eventLog = { events: [], cursor: null };
+      const eventsCreate = deltaWorld(1);
+
+      const result = await handleSuspension({
+        suspension: new WorkflowSuspension(
+          new Map([awaitedHook()]),
+          globalThis
+        ),
+        world: createWorld(eventsCreate),
+        run,
+        eventLog,
+      });
+
+      expect(eventsCreate.mock.calls[0][2]?.sinceCursor).toBeUndefined();
+      expect(result.eventLogCarriedForward).toBe(false);
+    });
+  });
 });
 
 describe('resilient step dispatch', () => {

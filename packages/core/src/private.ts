@@ -137,12 +137,13 @@ export interface WorkflowOrchestratorContext {
   globalThis: typeof globalThis;
   /**
    * Increments when a suspension is accepted and on every retained-session
-   * resume. STEP suspension signals capture it when scheduled and no-op if
-   * it moved (see step.ts) — this drops same-boundary sibling signals and
-   * timers queued at boundary N that would fire after the session resumed
-   * into boundary N+1. Sleep/hook/attribute signals are intentionally
-   * unguarded: their presence makes the boundary unretainable, so a late
-   * signal correctly demotes the session (workflow.ts `onWorkflowError`).
+   * resume. STEP and HOOK suspension signals capture it when scheduled and
+   * no-op if it moved (see step.ts and workflow/hook.ts) — this drops
+   * same-boundary sibling signals and timers queued at boundary N that would
+   * fire after the session resumed into boundary N+1. Sleep and attribute
+   * signals are intentionally unguarded: their presence makes the boundary
+   * unretainable, so a late signal correctly demotes the session (workflow.ts
+   * `onWorkflowError`).
    */
   suspensionGeneration: number;
   eventsConsumer: EventsConsumer;
