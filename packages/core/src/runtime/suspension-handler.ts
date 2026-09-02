@@ -166,7 +166,12 @@ export interface SuspensionHandlerResult {
    * pending wait collapse into a single delayed continuation.
    */
   waitTimeout?: { seconds: number; correlationId: string };
-  /** Whether a hook conflict was detected (should re-invoke immediately) */
+  /**
+   * Whether a hook create committed a `hook_conflict` — the token was already
+   * claimed, so this run's hook was never created and the workflow must
+   * observe the conflict before anything else this suspension scheduled runs.
+   * The caller answers it by advancing the workflow over the committed event.
+   */
   hasHookConflict: boolean;
   /** Whether a `hook.getConflict()` awaiter needs the workflow to continue immediately */
   hasAwaitedHookCreation: boolean;
@@ -185,6 +190,19 @@ export interface SuspensionHandlerResult {
    */
   awaitedHookCorrelationIds: string[];
   /**
+   * Correlation ids of the hooks whose create committed a `hook_conflict`.
+   * Empty exactly when {@link hasHookConflict} is false.
+   *
+   * By id for the same reason as {@link awaitedHookCorrelationIds}, and
+   * against the same hazard: a conflict is resolved by the `hook_conflict`
+   * this suspension committed, and until the workflow observes it the hook
+   * stays in the invocations queue and the next pass writes the create again.
+   * A fresh id is progress; the same id coming back is a pass that ran over a
+   * log which still did not hold the event, so continuing again cannot change
+   * that.
+   */
+  hookConflictCorrelationIds: string[];
+  /**
    * Whether the caller's `eventLog` now holds every event this suspension
    * committed, so a caller that continues in this process can replay — or
    * resume a retained VM — straight off it with no read.
@@ -194,6 +212,10 @@ export interface SuspensionHandlerResult {
    * suspension wrote an event. False whenever a read is needed first: no
    * delta was asked for or returned, it was truncated, or a step / wait /
    * attribute / abort write landed above it and is therefore not in it.
+   *
+   * Indifferent to which event the create committed: the delta is the slice
+   * of the log after the caller's cursor either way, so it carries a
+   * `hook_conflict` exactly as it carries a `hook_created`.
    */
   eventLogCarriedForward: boolean;
   /** Whether native workflow attribute events were written for replay. */
@@ -255,8 +277,11 @@ async function createHookEvent({
     });
 
     // Check if the world returned a hook_conflict event instead of hook_created.
-    // The hook_conflict event is stored in the event log and will be replayed
-    // on the next workflow invocation, causing the hook's promise to reject.
+    // The hook_conflict event is stored in the event log and is what the next
+    // pass consumes to settle the hook's awaiters — rejecting a payload await,
+    // resolving a `hook.getConflict()` with the conflicting run. An inline
+    // delta asked for above carries it just as it would have carried the
+    // hook_created, so the caller can advance over it without a re-invocation.
     if (result.event?.eventType === 'hook_conflict') {
       return {
         hasHookConflict: true,
@@ -547,20 +572,22 @@ export async function handleSuspension({
   }
 
   // Process hooks first to prevent race conditions with webhook receivers.
-  // Track any hook conflicts that occur — these are returned to the caller
-  // so the V2 handler can re-invoke immediately.
-  let hasHookConflict = false;
+  // Track any hook conflicts that occur — these are returned to the caller so
+  // it can advance the workflow over the committed `hook_conflict` before
+  // anything else this suspension scheduled runs.
+  const hookConflictCorrelationIds: string[] = [];
   const awaitedHookCorrelationIds: string[] = [];
   let hookCreationMs = 0;
 
   // Ask the hook create for the event-log delta since the cursor the caller's
-  // log was read at. A `hook.getConflict()` awaiter is resolved by the
-  // `hook_created` this write commits and by nothing else, so the caller can
-  // continue the workflow in its own process — but only over a log that holds
-  // that event, and this write is the one request that can hand it back
-  // together with anything another writer landed in the meantime. Optional by
-  // contract: a World that ignores `sinceCursor` returns no delta and the
-  // caller reads instead.
+  // log was read at. The hook's awaiters are settled by the event this write
+  // commits and by nothing else — a `hook_created` for a clean registration,
+  // a `hook_conflict` when the token was already claimed — so the caller can
+  // continue the workflow in its own process on either outcome, but only over
+  // a log that holds that event, and this write is the one request that can
+  // hand it back together with anything another writer landed in the meantime.
+  // Optional by contract: a World that ignores `sinceCursor` returns no delta
+  // and the caller reads instead.
   //
   // Asked for on the single-hook suspension only. Two creates issued from one
   // snapshot each diff against the same cursor, and only the first delta back
@@ -611,7 +638,9 @@ export async function handleSuspension({
               sinceCursor: hookDeltaCursor,
               createEvent: createGuarded,
             });
-            hasHookConflict ||= result.hasHookConflict;
+            if (result.hasHookConflict) {
+              hookConflictCorrelationIds.push(queueItem.correlationId);
+            }
             if (result.hasAwaitedHookCreation) {
               awaitedHookCorrelationIds.push(queueItem.correlationId);
             }
@@ -1114,10 +1143,13 @@ export async function handleSuspension({
     createdStepCorrelationIds,
     queuedStepCorrelationIds,
     lazyInlineSteps,
-    // On hook conflict the caller re-invokes immediately and never reads
-    // the wait timeout, so don't report one.
-    waitTimeout: hasHookConflict ? undefined : soonestWait,
-    hasHookConflict,
+    // On hook conflict the caller advances the workflow over the conflict
+    // before scheduling anything and never reads the wait timeout, so don't
+    // report one. The next pass, which sees the conflict settled, reports it.
+    waitTimeout:
+      hookConflictCorrelationIds.length > 0 ? undefined : soonestWait,
+    hasHookConflict: hookConflictCorrelationIds.length > 0,
+    hookConflictCorrelationIds,
     hasAwaitedHookCreation: awaitedHookCorrelationIds.length > 0,
     awaitedHookCorrelationIds,
     // The delta accounts for the whole log only if the write that returned it
